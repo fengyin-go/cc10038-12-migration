@@ -26,6 +26,16 @@ class IngestBatchPayload(BaseModel):
 class ParseBatchPayload(BaseModel):
     batch_no: str = Field(..., min_length=1)
     parser_rule_name: str | None = None
+    reprocess: bool = False
+
+
+class SchemaMigratePayload(BaseModel):
+    # 不传或为空表示一次迁完；传正整数模拟部署切换中断，只迁这么多行
+    limit: int | None = Field(default=None, ge=1)
+
+
+class SchemaRollbackPayload(BaseModel):
+    confirm: bool = True
 
 
 class DedupPayload(BaseModel):
@@ -61,8 +71,10 @@ class ReplayPayload(BaseModel):
 class SchemaEvolvePayload(BaseModel):
     version: str = Field(..., min_length=1)
     data_source: str = Field(..., min_length=1)
-    field_defs: list[str] = Field(..., min_length=1)
+    # 支持名称数组或带类型描述 [{"name": ..., "type": ...}]
+    field_defs: list[Any] = Field(..., min_length=1)
     backward_compatible: bool = True
+    typed: bool = False
 
 
 class FullPipelinePayload(BaseModel):
@@ -89,7 +101,9 @@ def pipeline_start_batch(payload: IngestBatchPayload) -> dict[str, Any]:
 
 @router.post("/batch/parse")
 def pipeline_parse_batch(payload: ParseBatchPayload) -> dict[str, Any]:
-    return pipeline.parse_batch(payload.batch_no, payload.parser_rule_name)
+    return pipeline.parse_batch(
+        payload.batch_no, payload.parser_rule_name, reprocess=payload.reprocess
+    )
 
 
 @router.post("/batch/recover")
@@ -132,8 +146,34 @@ def pipeline_replay_batch(payload: ReplayPayload) -> dict[str, Any]:
 @router.post("/schema/evolve")
 def pipeline_evolve_schema(payload: SchemaEvolvePayload) -> dict[str, Any]:
     return pipeline.evolve_schema(
-        payload.version, payload.data_source, payload.field_defs, payload.backward_compatible
+        payload.version,
+        payload.data_source,
+        payload.field_defs,
+        payload.backward_compatible,
+        typed=payload.typed,
     )
+
+
+@router.post("/schema/migrate")
+def pipeline_migrate_schema(payload: SchemaMigratePayload) -> dict[str, Any]:
+    """把历史名称数组字段定义迁移为带类型的版本描述，支持中断恢复。"""
+    from app.services.schema_evolution import schema_evolution
+    return schema_evolution.migrate(limit=payload.limit)
+
+
+@router.get("/schema/migration-status")
+def pipeline_migration_status() -> dict[str, Any]:
+    from app.services.schema_evolution import schema_evolution
+    return schema_evolution.migration_status()
+
+
+@router.post("/schema/rollback")
+def pipeline_rollback_schema(payload: SchemaRollbackPayload) -> dict[str, Any]:
+    """回滚为旧格式字段定义；旧解析入口恢复，已产出明细的类型依据保留。"""
+    from app.services.schema_evolution import schema_evolution
+    if not payload.confirm:
+        return {"ok": False, "message": "回滚需显式确认 confirm=true"}
+    return schema_evolution.rollback()
 
 
 @router.post("/full")

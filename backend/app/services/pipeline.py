@@ -7,10 +7,21 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import threading
 import time
 from typing import Any
 
 from app.store import store
+from app.services.schema_evolution import (
+    COL_FORMAT,
+    LEGACY_FORMAT,
+    TYPED_FORMAT,
+    TypeCoercionError,
+    coerce_value,
+    decode_field_defs,
+    encode_descriptors,
+    normalize_descriptors,
+)
 
 
 def _now_iso() -> str:
@@ -28,6 +39,20 @@ def _next_id(module: str) -> int:
 
 class IngestPipeline:
     """采集流水线统一编排，管理从数据源到导出的完整数据链路。"""
+
+    # 批内解析锁：同一批次的解析全程只允许一套完整字段解释，
+    # 升级与解析并发时第二个并发解析直接拒绝而不是混用两套 Schema。
+    _parse_locks: dict[str, threading.Lock] = {}
+    _parse_locks_guard = threading.Lock()
+
+    @classmethod
+    def _lock_for_batch(cls, batch_no: str) -> threading.Lock:
+        with cls._parse_locks_guard:
+            lock = cls._parse_locks.get(batch_no)
+            if lock is None:
+                lock = threading.Lock()
+                cls._parse_locks[batch_no] = lock
+            return lock
 
     # ---------- 阶段0：数据源登记与版本 ----------
     def register_source(self, source_id: str, protocol: str, region: str) -> dict[str, Any]:
@@ -138,17 +163,84 @@ class IngestPipeline:
         }
 
     # ---------- 阶段2：字段解析 ----------
+    def _resolve_schema(
+        self, source_id: str
+    ) -> tuple[dict[str, Any] | None, list[dict[str, str]] | None, str]:
+        """为数据源选定本次解析采用的 Schema 版本。
+
+        优先匹配适用数据源、状态为已发布的版本；没有同源版本时回退到任意
+        已发布版本。占位文本等无法解析的字段定义返回 ``(row, None, "")``，
+        调用方回退到解析规则驱动的旧入口，保证存量兼容。
+        """
+        schema_versions = store.rows("schema_version")
+        candidates = [sv for sv in schema_versions if sv.get("status") == "已发布"]
+        # 新批次采用同源最新发布版本；已 pin 的批次不受影响（在调用处处理）
+        source_candidates = [sv for sv in candidates if sv.get("适用数据源") == source_id]
+        if source_candidates:
+            chosen = source_candidates[-1]
+        elif candidates:
+            chosen = candidates[-1]
+        else:
+            chosen = None
+        descriptors, fmt = decode_field_defs(chosen.get("字段定义"))
+        return chosen, descriptors, fmt
+
+    @staticmethod
+    def _schema_snapshot(
+        schema_ver: dict[str, Any] | None,
+        descriptors: list[dict[str, str]] | None,
+        fmt: str,
+    ) -> dict[str, Any]:
+        """固化本次处理采用的字段解释，随批次/明细写入，供日后复算回查。"""
+        return {
+            "schema_version": schema_ver.get("版本号") if schema_ver else "v1.0",
+            "schema_format": fmt or LEGACY_FORMAT,
+            "field_definitions": copy.deepcopy(descriptors) if descriptors else [],
+        }
+
     def parse_batch(
         self,
         batch_no: str,
         parser_rule_name: str | None = None,
+        reprocess: bool = False,
     ) -> dict[str, Any]:
-        """解析批次中的原始日志为标准化明细。"""
+        """解析批次中的原始日志为标准化明细。
+
+        一个批次只允许一套完整的字段解释：首次解析时把当时选定的 Schema
+        版本号、字段定义形态和带类型描述固化到批次上（pin），之后重做旧批
+        一律按 pin 住的原版本复算，升级发布新版本不影响在途批次。
+        """
         raw_records_list = store.rows("raw_records")
         batch_raw = [r for r in raw_records_list if r.get("批次编号") == batch_no]
         if not batch_raw:
             return {"ok": False, "message": f"批次 {batch_no} 无原始日志记录"}
 
+        batches = store.rows("ingest_batch")
+        batch_entry = next((b for b in batches if b.get("批次编号") == batch_no), None)
+        if batch_entry is None:
+            return {"ok": False, "message": f"批次 {batch_no} 不存在"}
+
+        lock = self._lock_for_batch(batch_no)
+        if not lock.acquire(blocking=False):
+            return {
+                "ok": False,
+                "message": f"批次 {batch_no} 已有解析在执行，只允许一套完整字段解释",
+            }
+        try:
+            return self._parse_batch_locked(
+                batch_no, batch_entry, batch_raw, parser_rule_name, reprocess
+            )
+        finally:
+            lock.release()
+
+    def _parse_batch_locked(
+        self,
+        batch_no: str,
+        batch_entry: dict[str, Any],
+        batch_raw: list[dict[str, Any]],
+        parser_rule_name: str | None,
+        reprocess: bool,
+    ) -> dict[str, Any]:
         # 查找匹配的解析规则
         parsers = store.rows("field_parser")
         rule = None
@@ -165,15 +257,55 @@ class IngestPipeline:
         if rule is None:
             return {"ok": False, "message": "无可用解析规则，请先发布一条字段解析规则"}
 
-        # 获取当前 schema_version
-        schema_versions = store.rows("schema_version")
-        schema_ver = None
-        for sv in schema_versions:
-            if sv.get("status") == "已发布":
-                schema_ver = sv
-                break
+        source_id = batch_entry.get("所属数据源", "")
+
+        # 复算旧批：沿用首次解析 pin 住的版本；首次解析：选定并固化版本。
+        if reprocess and batch_entry.get("schema_pin"):
+            snapshot = json.loads(batch_entry["schema_pin"])
+            pinned_version = snapshot.get("schema_version")
+            schema_ver = next(
+                (sv for sv in store.rows("schema_version")
+                 if sv.get("版本号") == pinned_version),
+                None,
+            )
+            descriptors, fmt = decode_field_defs(
+                schema_ver.get("字段定义") if schema_ver else ""
+            )
+            if not descriptors:
+                descriptors = snapshot.get("field_definitions") or None
+                fmt = snapshot.get("schema_format", LEGACY_FORMAT)
+            snapshot = self._schema_snapshot(schema_ver, descriptors, fmt)
+        elif batch_entry.get("schema_pin"):
+            # 非复算的重复解析也不允许换版本，保证批内解释一致
+            snapshot = json.loads(batch_entry["schema_pin"])
+            pinned_version = snapshot.get("schema_version")
+            schema_ver = next(
+                (sv for sv in store.rows("schema_version")
+                 if sv.get("版本号") == pinned_version),
+                None,
+            )
+            descriptors, fmt = decode_field_defs(
+                schema_ver.get("字段定义") if schema_ver else ""
+            )
+            if not descriptors:
+                descriptors = snapshot.get("field_definitions") or None
+                fmt = snapshot.get("schema_format", LEGACY_FORMAT)
+        else:
+            schema_ver, descriptors, fmt = self._resolve_schema(source_id)
+            snapshot = self._schema_snapshot(schema_ver, descriptors, fmt)
+            batch_entry["schema_pin"] = json.dumps(snapshot, ensure_ascii=False)
 
         parsed_entities = store.rows("parsed_entity")
+
+        # 复算时保留首次解析的明细，旧明细标记被取代，不覆盖已有类型依据
+        superseded_ids: list[int] = []
+        if reprocess:
+            for old in parsed_entities:
+                if old.get("来源批次") == batch_no and old.get("superseded") is not True:
+                    old["superseded"] = True
+                    old["superseded_at"] = _now_iso()
+                    superseded_ids.append(int(old["id"]))
+
         success_count = 0
         failure_count = 0
         parsed_ids: list[int] = []
@@ -182,9 +314,13 @@ class IngestPipeline:
         for raw in batch_raw:
             raw_id = raw["id"]
             try:
-                # 模拟字段解析：将原始正文按规则打散
                 body = raw.get("原始正文", "")
-                fields = self._parse_body(body, rule)
+                if descriptors:
+                    fields, type_checks = self._parse_body_typed(body, rule, descriptors)
+                else:
+                    # 旧格式/占位 Schema：维持当前文本语义的解析入口
+                    fields = self._parse_body(body, rule)
+                    type_checks = {name: "text" for name in fields}
                 ent_id = _next_id("parsed_entity")
                 entity = {
                     "id": ent_id,
@@ -197,16 +333,41 @@ class IngestPipeline:
                     "pending": True,
                     "abnormal": False,
                     "parser_rule": rule.get("规则名称"),
-                    "schema_version": schema_ver.get("版本号") if schema_ver else "v1.0",
+                    "schema_version": snapshot["schema_version"],
+                    "schema_format": snapshot["schema_format"],
+                    "schema_field_types": json.dumps(type_checks, ensure_ascii=False),
+                    "schema_pin": json.dumps(snapshot, ensure_ascii=False),
+                    "reprocess": bool(reprocess),
                     "parsed_at": _now_iso(),
                     "content_digest": _stable_digest(fields),
                 }
                 parsed_entities.append(entity)
+                # 解析结果回写该次处理的来源清单（原始记录），历史批次可关联复算
                 raw["status"] = "已解析"
                 raw["pending"] = False
                 raw["解析状态"] = "已解析"
+                raw["source_manifest"] = json.dumps(
+                    {
+                        "batch_no": batch_no,
+                        "raw_record_id": raw_id,
+                        "parsed_entity_id": ent_id,
+                        "schema_version": snapshot["schema_version"],
+                        "schema_format": snapshot["schema_format"],
+                        "field_types": type_checks,
+                        "reprocess": bool(reprocess),
+                        "parsed_at": _now_iso(),
+                    },
+                    ensure_ascii=False,
+                )
                 success_count += 1
                 parsed_ids.append(ent_id)
+            except TypeCoercionError as exc:
+                raw["status"] = "解析失败"
+                raw["解析状态"] = "解析失败"
+                raw["abnormal"] = True
+                raw["last_error"] = str(exc)
+                failure_count += 1
+                failed_ids.append(raw_id)
             except Exception:
                 raw["status"] = "解析失败"
                 raw["解析状态"] = "解析失败"
@@ -215,21 +376,20 @@ class IngestPipeline:
                 failed_ids.append(raw_id)
 
         # 更新批次状态
-        batches = store.rows("ingest_batch")
-        for b in batches:
-            if b.get("批次编号") == batch_no:
-                b["status"] = "已完成" if failure_count == 0 else "部分失败"
-                b["pending"] = failure_count > 0
-                b["abnormal"] = failure_count > 0
-                b["parsed_ids"] = json.dumps(parsed_ids)
-                b["batch_version"] = b.get("batch_version", 1) + 1
-                break
+        batch_entry["status"] = "已完成" if failure_count == 0 else "部分失败"
+        batch_entry["pending"] = failure_count > 0
+        batch_entry["abnormal"] = failure_count > 0
+        batch_entry["parsed_ids"] = json.dumps(parsed_ids)
+        batch_entry["active_parsed_ids"] = json.dumps(parsed_ids)
+        batch_entry["schema_version"] = snapshot["schema_version"]
+        batch_entry["schema_format"] = snapshot["schema_format"]
+        batch_entry["batch_version"] = batch_entry.get("batch_version", 1) + 1
 
-        # 记录解析日志
+        # 记录解析日志：批内可追到当时采用的版本
         journal = store.rows("parse_journal")
         journal_entry = {
             "id": _next_id("parse_journal"),
-            "操作类型": "批量解析",
+            "操作类型": "复算解析" if reprocess else "批量解析",
             "批次编号": batch_no,
             "执行时间": _now_iso(),
             "影响的记录数": str(success_count),
@@ -239,6 +399,11 @@ class IngestPipeline:
             "abnormal": failure_count > 0,
             "success_count": str(success_count),
             "failure_count": str(failure_count),
+            "schema_version": snapshot["schema_version"],
+            "schema_format": snapshot["schema_format"],
+            "schema_pin": json.dumps(snapshot, ensure_ascii=False),
+            "reprocess": bool(reprocess),
+            "superseded_entity_ids": json.dumps(superseded_ids),
         }
         journal.append(journal_entry)
 
@@ -258,6 +423,7 @@ class IngestPipeline:
                     "abnormal": False,
                     "batch_no": batch_no,
                     "parser_rule": rule.get("规则名称"),
+                    "schema_version": snapshot["schema_version"],
                 }
                 retry_q.append(retry_entry)
 
@@ -268,7 +434,38 @@ class IngestPipeline:
             "failure": failure_count,
             "parsed_ids": parsed_ids,
             "failed_ids": failed_ids,
+            "schema_version": snapshot["schema_version"],
+            "schema_format": snapshot["schema_format"],
+            "field_types": json.loads(json.dumps(
+                {d["name"]: d["type"] for d in (descriptors or [])},
+                ensure_ascii=False,
+            )),
+            "reprocess": bool(reprocess),
+            "superseded_entity_ids": superseded_ids,
         }
+
+    def _parse_body_typed(
+        self,
+        body: str,
+        rule: dict[str, Any],
+        descriptors: list[dict[str, str]],
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        """按带类型的版本描述解析：字段名来自 Schema 描述，值按各字段类型核对。
+
+        原始正文仍按 ``|`` 分隔，位置与描述符顺序对齐。已有字段以文本语义
+        读取，新增数字类型才按 number 解析；任一数字字段核对失败即抛
+        ``TypeCoercionError``，整条记录进入解析失败/重试。
+        """
+        parts = body.split("|") if "|" in body else [body]
+        fields: dict[str, Any] = {}
+        type_checks: dict[str, str] = {}
+        for idx, descriptor in enumerate(descriptors):
+            name = descriptor["name"]
+            field_type = descriptor["type"]
+            raw_text = parts[idx].strip() if idx < len(parts) else ""
+            fields[name] = coerce_value(raw_text, field_type)
+            type_checks[name] = field_type
+        return fields, type_checks
 
     def _parse_body(self, body: str, rule: dict[str, Any]) -> dict[str, Any]:
         """模拟字段解析逻辑。种子数据中的规则可能只有占位文本，此时使用默认字段名。"""
@@ -624,10 +821,20 @@ class IngestPipeline:
         self,
         version: str,
         data_source: str,
-        field_defs: list[str],
+        field_defs: list[Any],
         backward_compatible: bool = True,
+        typed: bool = False,
     ) -> dict[str, Any]:
-        """发布新 Schema 版本并检查向后兼容性。"""
+        """发布新 Schema 版本并检查向后兼容性。
+
+        ``field_defs`` 支持两种入参：
+
+        - 名称数组（``["time", "level"]``）：按旧格式存储，全部字段按文本读取，
+          存量调用方无需改动；
+        - 带类型定义（``[{"name": "latency", "type": "number"}]`` 或
+          ``[("latency", "number")]`` 混写）：``typed=True`` 时存为带类型的
+          版本描述，数字字段随版本记录类型。
+        """
         schemas = store.rows("schema_version")
 
         # 如果已有同名版本，不能重复发布
@@ -635,22 +842,50 @@ class IngestPipeline:
             if s.get("版本号") == version:
                 return {"ok": False, "message": f"Schema 版本 {version} 已存在"}
 
+        descriptors = normalize_descriptors(field_defs)
+        if typed:
+            stored_defs = encode_descriptors(descriptors)
+            fmt = TYPED_FORMAT
+        else:
+            # 旧格式：只保留名称数组，兼容历史采集流水线和回滚后的解析入口
+            stored_defs = json.dumps(
+                [d["name"] for d in descriptors], ensure_ascii=False
+            )
+            fmt = LEGACY_FORMAT
+
         entry = {
             "id": _next_id("schema_version"),
             "版本号": version,
             "适用数据源": data_source,
-            "字段定义": json.dumps(field_defs, ensure_ascii=False),
+            "字段定义": stored_defs,
             "向后兼容标记": "是" if backward_compatible else "否",
             "发布说明": f"版本 {version} 发布，兼容={backward_compatible}",
             "status": "已发布",
             "pending": False,
             "abnormal": False,
             "published_at": _now_iso(),
-            "field_count": len(field_defs),
+            "field_count": len(descriptors),
+            COL_FORMAT: fmt,
         }
         schemas.append(entry)
 
         return {"ok": True, "message": f"Schema 版本 {version} 已发布", "schema": entry}
+
+    def evolve_typed_schema(
+        self,
+        version: str,
+        data_source: str,
+        typed_fields: list[dict[str, str]],
+        backward_compatible: bool = True,
+    ) -> dict[str, Any]:
+        """便捷入口：发布带字段类型的新 Schema 版本。"""
+        return self.evolve_schema(
+            version,
+            data_source,
+            normalize_descriptors(typed_fields),
+            backward_compatible=backward_compatible,
+            typed=True,
+        )
 
     # ---------- 全链路流水线 ----------
     def run_full_pipeline(

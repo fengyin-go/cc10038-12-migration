@@ -79,5 +79,28 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## Schema 字段定义迁移（名称数组 → 带类型版本描述）
+
+`schema_version.字段定义` 历史上只存字段名称数组，新增数字字段无法随版本记录类型。
+迁移机制在 `backend/app/services/schema_evolution.py`，两种形态长期共存：
+
+- 旧格式 `legacy_names`：`["event", "latency"]`，全部按文本语义读取；
+- 新格式 `typed_v2`：`[{"name": "latency", "type": "number"}]`，数字字段随版本记录类型。
+
+关键保证：
+
+- **存量兼容**：解析入口对两种形态都可读；名称数组、占位文本自动回退旧入口。
+- **中断恢复**：`POST /api/pipeline/schema/migrate` 按版本行逐行原子迁移，进度写入
+  `schema_migration` 表；传 `{"limit": n}` 模拟部署切换中断，重入自动跳过已迁移行。
+- **回滚**：`POST /api/pipeline/schema/rollback` 恢复旧格式名称数组（含直接按
+  typed 发布的新版本降级），旧解析入口立即可用。
+- **批次版本 pin**：批次首次解析时固化当时的版本号、形态与带类型描述（`schema_pin`），
+  同批次并发解析由批内锁拒绝；之后发布新版本不改变在途/历史批次，
+  `POST /api/pipeline/batch/parse` 传 `{"reprocess": true}` 按原版本复算旧批。
+- **来源清单回查**：解析结果回写 `raw_records.source_manifest`，标准化明细自带
+  `schema_version/schema_format/schema_field_types/schema_pin`，回滚后类型依据不丢。
+- 已有字段保持文本语义，仅新增的 `number` 类型按 int/float 核对，无法核对的记录
+  进入解析失败与重试队列。
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA
